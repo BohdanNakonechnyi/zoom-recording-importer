@@ -916,6 +916,146 @@ def render_main_storage_panel(client: ZoomClient, cached: dict | None) -> dict:
     return info
 
 
+def screen_update():
+    """Оновлення скрипту з GitHub через git pull."""
+    import subprocess
+    draw_header("🔄 Оновлення скрипту")
+
+    script_dir = Path(__file__).parent
+
+    # ── Перевірка наявності git ──
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        console.print(Panel(
+            "[red]git не знайдено.[/]\n"
+            "Встанови Git: [cyan]https://git-scm.com/download[/]",
+            border_style="red",
+        ))
+        pause()
+        return
+
+    # ── Перевірка що ми в git репозиторії ──
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        capture_output=True, text=True, cwd=script_dir,
+    )
+    if result.returncode != 0:
+        console.print(Panel(
+            "[red]Папка не є git репозиторієм.[/]\n"
+            "Переконайся що скрипт склонований через [cyan]git clone[/]",
+            border_style="red",
+        ))
+        pause()
+        return
+
+    remote_url = result.stdout.strip()
+    console.print(f"[dim]Репозиторій:[/] {remote_url}\n")
+
+    # ── Поточна версія (останній коміт) ──
+    current = subprocess.run(
+        ["git", "log", "-1", "--format=%h  %s  (%cr)"],
+        capture_output=True, text=True, cwd=script_dir,
+    ).stdout.strip()
+    console.print(f"[cyan]Поточна версія:[/] {current}\n")
+
+    # ── Перевірка що є нові коміти ──
+    console.print("[dim]Перевірка оновлень...[/]")
+    subprocess.run(["git", "fetch"], capture_output=True, cwd=script_dir)
+
+    behind = subprocess.run(
+        ["git", "rev-list", "HEAD..origin/master", "--count"],
+        capture_output=True, text=True, cwd=script_dir,
+    ).stdout.strip()
+
+    # Спробуємо також main якщо master не знайшло
+    if not behind.isdigit():
+        behind = subprocess.run(
+            ["git", "rev-list", "HEAD..origin/main", "--count"],
+            capture_output=True, text=True, cwd=script_dir,
+        ).stdout.strip()
+
+    commits_behind = int(behind) if behind.isdigit() else 0
+
+    if commits_behind == 0:
+        console.print(Panel(
+            "[green]✓ У вас остання версія скрипту.[/]",
+            border_style="green",
+        ))
+        pause()
+        return
+
+    # ── Показуємо що нового ──
+    console.print(f"[yellow]Доступно нових комітів: {commits_behind}[/]\n")
+
+    new_commits = subprocess.run(
+        ["git", "log", "HEAD..origin/master", "--format=  • %s  (%cr)", "--no-merges"],
+        capture_output=True, text=True, cwd=script_dir,
+    ).stdout.strip()
+    if not new_commits:
+        new_commits = subprocess.run(
+            ["git", "log", "HEAD..origin/main", "--format=  • %s  (%cr)", "--no-merges"],
+            capture_output=True, text=True, cwd=script_dir,
+        ).stdout.strip()
+
+    if new_commits:
+        console.print(Panel(
+            new_commits,
+            title="[cyan]Нові зміни[/]",
+            border_style="cyan",
+        ))
+        console.print()
+
+    confirmed = inquirer.confirm(
+        message="Оновити скрипт?",
+        default=True,
+    ).execute()
+
+    if not confirmed:
+        console.print("[yellow]Скасовано.[/]")
+        pause()
+        return
+
+    # ── git pull ──
+    pull = subprocess.run(
+        ["git", "pull"],
+        capture_output=True, text=True, cwd=script_dir,
+    )
+
+    if pull.returncode != 0:
+        console.print(Panel(
+            f"[red]Помилка оновлення:[/]\n{pull.stderr.strip()}",
+            border_style="red",
+        ))
+        pause()
+        return
+
+    console.print(f"[green]✓ Оновлено![/]\n{pull.stdout.strip()}\n")
+
+    # ── Перевіряємо чи змінився requirements.txt ──
+    changed_files = subprocess.run(
+        ["git", "diff", "HEAD~1", "--name-only"],
+        capture_output=True, text=True, cwd=script_dir,
+    ).stdout.strip()
+
+    if "requirements.txt" in changed_files:
+        console.print("[yellow]requirements.txt змінився — оновлюємо залежності...[/]")
+        pip = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"],
+            capture_output=True, text=True, cwd=script_dir,
+        )
+        if pip.returncode == 0:
+            console.print("[green]✓ Залежності оновлені.[/]")
+        else:
+            console.print(f"[red]Помилка pip:[/] {pip.stderr.strip()}")
+
+    console.print(Panel(
+        "[green]✓ Скрипт оновлено.[/] Перезапусти програму щоб зміни вступили в силу.",
+        border_style="green",
+    ))
+    pause()
+
+
 def main():
     client = ZoomClient()
     storage_cache: dict | None = None   # кешуємо щоб не запитувати кожного разу
@@ -931,19 +1071,22 @@ def main():
                 Choice("list",     "📋  Переглянути записи"),
                 Choice("download", "📥  Завантажити записи"),
                 Separator("─" * 30),
+                Choice("update",   "🔄  Оновити скрипт з GitHub"),
                 Choice("exit",     "❌  Вийти"),
             ],
             pointer="▶",
         ).execute()
 
         if action == "storage":
-            storage_cache = None          # скидаємо кеш → примусове оновлення
+            storage_cache = None
             screen_cloud_storage(client)
         elif action == "list":
             screen_list_recordings(client)
         elif action == "download":
             screen_download(client)
-            storage_cache = None          # після завантаження оновлюємо стан диску
+            storage_cache = None
+        elif action == "update":
+            screen_update()
         elif action == "exit":
             console.print("\n[dim]До побачення![/]\n")
             break
