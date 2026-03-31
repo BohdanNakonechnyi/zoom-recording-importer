@@ -365,11 +365,31 @@ def ask_date_range() -> tuple[str, str]:
     return (today - timedelta(days=days)).strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
+ALL_FILE_TYPES = {"MP4", "M4A", "TRANSCRIPT", "CHAT", "CC"}
+
+
 def ask_file_types() -> set:
-    selected = inquirer.checkbox(
+    choice = inquirer.select(
         message="Типи файлів:",
         choices=[
-            Choice("MP4",        name="MP4        — відео запис",         enabled=True),
+            Choice("MP4",  "MP4        — тільки відео (найчастіше)"),
+            Choice("all",  "Всі типи   — MP4 + M4A + TRANSCRIPT + CHAT + CC"),
+            Choice("pick", "Вибрати вручну..."),
+        ],
+        default="MP4",
+    ).execute()
+
+    if choice == "all":
+        return ALL_FILE_TYPES.copy()
+
+    if choice == "MP4":
+        return {"MP4"}
+
+    # Вручну
+    selected = inquirer.checkbox(
+        message="Оберіть типи файлів:",
+        choices=[
+            Choice("MP4",        name="MP4        — відео запис",        enabled=True),
             Choice("M4A",        name="M4A        — тільки аудіо"),
             Choice("TRANSCRIPT", name="TRANSCRIPT — авто транскрипт"),
             Choice("CHAT",       name="CHAT       — чат повідомлення"),
@@ -439,14 +459,14 @@ MAX_PATH_LEN    = 240  # залишаємо запас до ліміту Windows
 
 def safe_meeting_dir(output_dir: Path, date: str, topic: str) -> Path:
     """
-    Будує шлях до папки зустрічі, обрізаючи назву якщо шлях надто довгий.
+    Структура: output_dir / YYYY-MM-DD / назва_зустрічі
+    Обрізає назву якщо загальний шлях надто довгий (ліміт Windows 260).
     """
     topic_short = topic[:MAX_FOLDER_NAME]
-    candidate = output_dir / f"{date}_{topic_short}"
-    # Якщо шлях все одно занадто довгий — ще скорочуємо
+    candidate = output_dir / date / topic_short
     while len(str(candidate)) > MAX_PATH_LEN and len(topic_short) > 8:
         topic_short = topic_short[:-5]
-        candidate = output_dir / f"{date}_{topic_short}"
+        candidate = output_dir / date / topic_short
     return candidate
 
 
