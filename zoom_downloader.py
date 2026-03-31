@@ -91,9 +91,35 @@ CHECKBOX_STYLE = get_style({
 
 console = Console()
 
-ZOOM_API_BASE = "https://api.zoom.us/v2"
-ZOOM_OAUTH_URL = "https://zoom.us/oauth/token"
+ZOOM_API_BASE    = "https://api.zoom.us/v2"
+ZOOM_OAUTH_URL   = "https://zoom.us/oauth/token"
 MAX_DATE_RANGE_DAYS = 30
+
+# ── Конфіг ────────────────────────────────────────────────────────────────────
+CONFIG_PATH = Path(__file__).parent / "config.json"
+_DEFAULT_DOWNLOAD = str(Path.home() / "Downloads" / "ZoomRecordings")
+
+
+def load_config() -> dict:
+    """Зчитує config.json або повертає дефолтні значення."""
+    import json
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(data: dict) -> None:
+    """Зберігає config.json (зливає з існуючим)."""
+    import json
+    current = load_config()
+    current.update(data)
+    CONFIG_PATH.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ─── Утиліти ──────────────────────────────────────────────────────────────────
@@ -483,12 +509,14 @@ def ask_file_types() -> set:
 
 
 def ask_output_dir() -> Path:
-    default = str(Path.home() / "Downloads" / "ZoomRecordings")
+    cfg     = load_config()
+    default = cfg.get("default_download_path") or _DEFAULT_DOWNLOAD
     path_str = inquirer.text(
         message="Директорія збереження:",
         default=default,
     ).execute()
     p = Path(path_str).resolve()
+    save_config({"default_download_path": str(p)})
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -748,12 +776,31 @@ def screen_download(client: ZoomClient):
         return
 
     # 3. Інтерактивний вибір файлів
+    n_new  = sum(1 for f in files if not f["done"])
+    n_done = sum(1 for f in files if f["done"])
+
+    pre = inquirer.select(
+        message="Початковий вибір:",
+        choices=[
+            Choice("new",  f"Тільки нові         — {n_new} файл(ів)"),
+            Choice("none", f"Нічого не виділяти  — вибрати вручну"),
+            Choice("all",  f"Всі файли           — {len(files)} файл(ів) (включно з вже скачаними)"),
+        ],
+        default="new",
+    ).execute()
+
+    console.print()
     console.print(
         "  [green]✓[/] буде завантажено    [red]✗[/] пропустити    "
-        "[dim](пробіл — вибрати/зняти, a — всі, Ctrl+C або << Скасувати — вийти)[/]\n"
+        "[dim](пробіл — вибрати/зняти, a — toggle all, Ctrl+C або << Скасувати — вийти)[/]\n"
     )
 
     _CANCEL = object()  # sentinel для кнопки "Скасувати"
+
+    def _initial_enabled(f: dict) -> bool:
+        if pre == "all":  return True
+        if pre == "none": return False
+        return not f["done"]   # "new" — тільки ті що ще не скачані
 
     choices = []
     choices.append(Choice(value=_CANCEL, name="<< Скасувати та вийти з меню >>"))
@@ -767,7 +814,7 @@ def screen_download(client: ZoomClient):
         choices.append(Choice(
             value=f,
             name=label,
-            enabled=not f["done"],
+            enabled=_initial_enabled(f),
         ))
 
     selected = inquirer.checkbox(
