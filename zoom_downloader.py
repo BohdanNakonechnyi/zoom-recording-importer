@@ -28,8 +28,66 @@ from rich import box
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
+from InquirerPy.utils import get_style
 
 load_dotenv()
+
+# Прибираємо '?' та замінюємо Unicode символи на ASCII для сумісності з cmd.exe
+try:
+    from InquirerPy.base.simple import BaseSimplePrompt
+    _orig_init = BaseSimplePrompt.__init__
+    def _no_qmark_init(self, *args, qmark="", amark="", **kwargs):
+        _orig_init(self, *args, qmark=qmark, amark=amark, **kwargs)
+    BaseSimplePrompt.__init__ = _no_qmark_init
+except Exception:
+    pass
+
+# Патч: окремі кольори для ✓ (вибрано) та ✗ (не вибрано) у checkbox
+try:
+    from InquirerPy.prompts.checkbox import InquirerPyCheckboxControl
+    from InquirerPy.separator import Separator as _Sep
+
+    def _hover_colored(self, choice):
+        display = []
+        display.append(("class:pointer", self._pointer))
+        if self._pointer:
+            display.append(("", " "))
+        if not isinstance(choice["value"], _Sep):
+            cls = "class:cb-on" if choice["enabled"] else "class:cb-off"
+            sym = self._enabled_symbol if choice["enabled"] else self._disabled_symbol
+            display.append((cls, sym))
+            if self._enabled_symbol and self._disabled_symbol:
+                display.append(("", " "))
+        display.append(("[SetCursorPosition]", ""))
+        display.append(("class:pointer", choice["name"]))
+        return display
+
+    def _normal_colored(self, choice):
+        display = []
+        display.append(("", len(self._pointer) * " "))
+        if self._pointer:
+            display.append(("", " "))
+        if not isinstance(choice["value"], _Sep):
+            cls = "class:cb-on" if choice["enabled"] else "class:cb-off"
+            sym = self._enabled_symbol if choice["enabled"] else self._disabled_symbol
+            display.append((cls, sym))
+            if self._enabled_symbol and self._disabled_symbol:
+                display.append(("", " "))
+            display.append(("", choice["name"]))
+        else:
+            display.append(("class:separator", choice["name"]))
+        return display
+
+    InquirerPyCheckboxControl._get_hover_text = _hover_colored
+    InquirerPyCheckboxControl._get_normal_text = _normal_colored
+except Exception:
+    pass
+
+# Стиль для checkbox: зелений ✓, червоний ✗
+CHECKBOX_STYLE = get_style({
+    "cb-on":  "#00cc44 bold",
+    "cb-off": "#cc3333",
+})
 
 console = Console()
 
@@ -183,69 +241,86 @@ class ZoomClient:
             return int(float(quota_gb) * (1024 ** 3)), ""
         return 0, "Квота не задана — додайте ZOOM_STORAGE_QUOTA_GB=90 у .env файл"
 
-    def _fetch_user_size(self, user_id: str, from_date: str, to_date: str) -> int:
-        """Повертає сумарний розмір записів одного юзера (в байтах)."""
+    def _fetch_chunk_size(self, user_id: str, chunk_from: str, chunk_to: str) -> int:
+        """Повертає розмір записів одного юзера за один 30-денний чанк."""
         size = 0
-        meetings = self.list_recordings(from_date, to_date, user_id=user_id)
-        for m in meetings:
-            for f in m.get("recording_files", []):
-                size += f.get("file_size", 0)
+        page_token = None
+        while True:
+            params: dict = {"from": chunk_from, "to": chunk_to, "page_size": 300}
+            if page_token:
+                params["next_page_token"] = page_token
+            resp = requests.get(
+                f"{ZOOM_API_BASE}/users/{user_id}/recordings",
+                headers=self._h(),
+                params=params,
+                timeout=30,
+            )
+            if resp.status_code == 404:
+                return 0
+            resp.raise_for_status()
+            data = resp.json()
+            for m in data.get("meetings", []):
+                for f in m.get("recording_files", []):
+                    size += f.get("file_size", 0)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
         return size
 
     def get_cloud_storage_info(self) -> dict:
         """
         Повертає загальне використання хмарного сховища по всіх юзерах акаунту.
-        Потрібні scopes:
-          - cloud_recording:read:list_user_recordings:admin  — записи юзерів
-          - user:read:list_users:admin                       — список всіх юзерів
-          - account:read:account_setting:admin               — для спроби отримати квоту
+        Паралелить кожен (юзер × 30-денний чанк) окремим потоком — до 20 одночасно.
         Повертає {"used": int, "total": int, "users_checked": int, "errors": list}.
         """
         errors = []
         used = 0
-        users_checked = 0
+        succeeded_users: set = set()
 
-        # ── 1. Квота (паралельно з іншим) ──
         total, quota_err = self._get_quota_bytes()
         if quota_err:
             errors.append(quota_err)
 
-        # ── 2. Список юзерів ──
         try:
             all_users = self.get_all_users()
         except requests.HTTPError as e:
-            if e.response.status_code in (401, 403):
-                errors.append("Список юзерів: потрібен scope user:read:list_users:admin")
-            else:
-                errors.append(f"Список юзерів: HTTP {e.response.status_code}")
+            errors.append(f"Список юзерів: HTTP {e.response.status_code}")
             all_users = [{"id": "me", "email": "", "display_name": "me"}]
         except Exception as e:
             errors.append(f"Список юзерів: {e}")
             all_users = [{"id": "me", "email": "", "display_name": "me"}]
 
-        # ── 3. Паралельне завантаження записів для всіх юзерів ──
         from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-        to_date = datetime.now().strftime("%Y-%m-%d")
+        to_date   = datetime.now().strftime("%Y-%m-%d")
+        chunks    = list(split_date_range(from_date, to_date))
 
-        with ThreadPoolExecutor(max_workers=min(5, len(all_users))) as executor:
+        # Всі завдання: одне на кожну пару (юзер, чанк)
+        tasks = [(u, cf, ct) for u in all_users for cf, ct in chunks]
+
+        with ThreadPoolExecutor(max_workers=min(20, len(tasks))) as executor:
             futures = {
-                executor.submit(self._fetch_user_size, u["id"], from_date, to_date): u
-                for u in all_users
+                executor.submit(self._fetch_chunk_size, u["id"], cf, ct): u
+                for u, cf, ct in tasks
             }
             for future in as_completed(futures):
                 u = futures[future]
                 try:
                     used += future.result()
-                    users_checked += 1
+                    succeeded_users.add(u["id"])
                 except requests.HTTPError as e:
                     errors.append(f"Записи {u['email'] or u['id']}: HTTP {e.response.status_code}")
                 except Exception as e:
                     errors.append(f"Записи {u['email'] or u['id']}: {e}")
 
-        if users_checked == 0:
+        if not succeeded_users:
             errors.append("Не вдалось отримати записи жодного користувача")
 
-        return {"used": used, "total": total, "users_checked": users_checked, "errors": errors}
+        return {
+            "used": used,
+            "total": total,
+            "users_checked": len(succeeded_users),
+            "errors": errors,
+        }
 
     def list_recordings(self, from_date: str, to_date: str, user_id: str = "me") -> list:
         all_meetings = []
@@ -673,25 +748,43 @@ def screen_download(client: ZoomClient):
         return
 
     # 3. Інтерактивний вибір файлів
+    console.print(
+        "  [green]✓[/] буде завантажено    [red]✗[/] пропустити    "
+        "[dim](пробіл — вибрати/зняти, a — всі, Ctrl+C або << Скасувати — вийти)[/]\n"
+    )
+
+    _CANCEL = object()  # sentinel для кнопки "Скасувати"
+
     choices = []
+    choices.append(Choice(value=_CANCEL, name="<< Скасувати та вийти з меню >>"))
+    choices.append(Separator("─" * 78))
+
     for f in sorted(files, key=lambda x: (x["date"], x["meeting"]), reverse=True):
-        icon = "[green]✓[/] " if f["done"] else "[blue]↓[/] "
         label = (
             f"{f['date']}  {f['meeting'][:35]:<35}  "
             f"{f['dest'].name:<22}  {format_size(f['size']):>9}"
         )
         choices.append(Choice(
             value=f,
-            name=f"{icon}{label}",
+            name=label,
             enabled=not f["done"],
         ))
 
     selected = inquirer.checkbox(
         message=f"Виберіть файли ({len(files)} знайдено):",
         choices=choices,
-        instruction="(пробіл — вибрати/зняти, a — всі, Enter — підтвердити)",
-        transformer=lambda x: f"{len(x)} файл(ів) вибрано",
+        instruction="",
+        transformer=lambda x: f"{sum(1 for v in x if v is not _CANCEL)} файл(ів) вибрано",
+        enabled_symbol="✓",
+        disabled_symbol="✗",
+        style=CHECKBOX_STYLE,
+        raise_keyboard_interrupt=False,
+        mandatory=False,
     ).execute()
+
+    # Вихід: Ctrl+C або вибрали "Скасувати"
+    if selected is None or any(v is _CANCEL for v in selected):
+        return
 
     if not selected:
         console.print("[yellow]Нічого не вибрано.[/]")
@@ -871,12 +964,8 @@ def screen_download(client: ZoomClient):
 # ─── Точка входу ──────────────────────────────────────────────────────────────
 
 def render_main_storage_panel(cached: dict | None):
-    """
-    Малює компактну шкалу сховища на головному екрані.
-    Використовує тільки кешовані дані — без жодних API запитів.
-    API запит робиться тільки в screen_cloud_storage().
-    """
-    # ── Zoom cloud (тільки з кешу) ──
+    """Малює компактну шкалу сховища на головному екрані."""
+    # ── Zoom cloud ──
     if cached and cached.get("used", 0) > 0:
         used  = cached["used"]
         total = cached.get("total", 0)
@@ -898,9 +987,7 @@ def render_main_storage_panel(cached: dict | None):
                 f"[dim]{users} юзерів[/]"
             )
     else:
-        zoom_line = (
-            "Zoom:  [dim]не завантажено — оберіть [1] щоб отримати дані[/]"
-        )
+        zoom_line = "Zoom:  [dim]дані недоступні — оберіть [1] щоб спробувати знову[/]"
 
     # ── Локальний диск (завжди актуально, без API) ──
     local  = shutil.disk_usage(Path.home())
@@ -1062,13 +1149,18 @@ def screen_update():
 
 def main():
     client = ZoomClient()
-    # Кеш заповнюється після відвідування screen_cloud_storage
-    # На головному екрані API не викликається — меню завжди відкривається миттєво
-    storage_cache: dict | None = None
+
+    # Завантажуємо дані сховища один раз при старті
+    draw_header()
+    console.print("[dim]Завантаження даних сховища Zoom...[/]")
+    try:
+        storage_cache = client.get_cloud_storage_info()
+    except Exception:
+        storage_cache = None
 
     while True:
         draw_header()
-        render_main_storage_panel(storage_cache)   # тільки відображення, без запитів
+        render_main_storage_panel(storage_cache)
 
         action = inquirer.select(
             message="Виберіть дію:",
@@ -1084,7 +1176,7 @@ def main():
         ).execute()
 
         if action == "storage":
-            storage_cache = screen_cloud_storage(client)  # повертає свіжі дані
+            storage_cache = screen_cloud_storage(client)
         elif action == "list":
             screen_list_recordings(client)
         elif action == "download":
