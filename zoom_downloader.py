@@ -317,8 +317,13 @@ class ZoomClient:
 
 # ─── Спільні UI елементи ──────────────────────────────────────────────────────
 
+def clear_screen():
+    """Очищення екрану — працює і в cmd.exe і в PowerShell/Linux."""
+    os.system("cls" if os.name == "nt" else "clear")
+
+
 def draw_header(subtitle: str = ""):
-    console.clear()
+    clear_screen()
     title = "[bold cyan]Zoom Recording Downloader[/]"
     if subtitle:
         title += f"\n[dim]{subtitle}[/]"
