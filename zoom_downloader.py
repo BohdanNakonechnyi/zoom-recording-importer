@@ -1036,14 +1036,24 @@ def render_main_storage_panel(cached: dict | None):
     else:
         zoom_line = "Zoom:  [dim]дані недоступні — оберіть [1] щоб спробувати знову[/]"
 
-    # ── Локальний диск (завжди актуально, без API) ──
-    local  = shutil.disk_usage(Path.home())
+    # ── Локальний диск — береться з конфігу (де будуть зберігатись записи) ──
+    cfg          = load_config()
+    download_dir = Path(cfg.get("default_download_path") or _DEFAULT_DOWNLOAD)
+    # Якщо шлях ще не існує — беремо корінь диску (щоб disk_usage не впав)
+    disk_check = download_dir
+    while not disk_check.exists() and disk_check != disk_check.parent:
+        disk_check = disk_check.parent
+
+    local  = shutil.disk_usage(disk_check)
     lpct   = local.used / local.total * 100
     lcolor = "green" if lpct < 80 else "yellow" if lpct < 92 else "red"
     lbar   = render_bar(local.used, local.total, width=28)
+    # Показуємо букву диску (Windows) або точку монтування (Linux/Mac)
+    disk_label = disk_check.anchor.rstrip("\\/") or str(disk_check)
     disk_line = (
         f"Диск:  {lbar} [{lcolor}]{lpct:.0f}%[/]  "
         f"[dim]вільно[/] [{lcolor}]{format_size(local.free)}[/]"
+        f"  [dim]({disk_label})[/]"
     )
 
     console.print(Panel(
