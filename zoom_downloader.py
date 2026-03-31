@@ -503,8 +503,9 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
 
 # ─── Екрани ───────────────────────────────────────────────────────────────────
 
-def screen_cloud_storage(client: ZoomClient):
-    draw_header("☁  Хмарне сховище Zoom")
+def screen_cloud_storage(client: ZoomClient) -> dict:
+    """Повертає dict з інфо про сховище для кешування в main()."""
+    draw_header("Хмарне сховище Zoom")
 
     with console.status("[dim]Отримання інформації про сховище...[/]", spinner="dots"):
         info = client.get_cloud_storage_info()
@@ -540,7 +541,7 @@ def screen_cloud_storage(client: ZoomClient):
 
     console.print(Panel(
         body,
-        title="[cyan]☁  Хмарне сховище Zoom[/]",
+        title="[cyan]Хмарне сховище Zoom[/]",
         border_style="cyan",
         padding=(1, 2),
     ))
@@ -554,16 +555,17 @@ def screen_cloud_storage(client: ZoomClient):
         f"  Використано:  [bold]{format_size(home_usage.used)}[/] / {format_size(home_usage.total)}\n"
         f"  Вільно:       [green]{format_size(home_usage.free)}[/]\n\n"
         f"  {local_bar}  [bold]{local_pct:.1f}%[/]",
-        title=f"[cyan]💾  Локальний диск ({Path.home().anchor})[/]",
+        title=f"[cyan]Локальний диск ({Path.home().anchor})[/]",
         border_style="cyan",
         padding=(1, 2),
     ))
 
     pause()
+    return info
 
 
 def screen_list_recordings(client: ZoomClient):
-    draw_header("📋 Перегляд записів")
+    draw_header("Перегляд записів")
 
     from_date, to_date = ask_date_range()
     console.print()
@@ -635,7 +637,7 @@ def _try_download(client: ZoomClient, f: dict) -> str:
 
 
 def screen_download(client: ZoomClient):
-    draw_header("📥 Завантаження записів")
+    draw_header("Завантаження записів")
 
     # 1. Параметри пошуку
     from_date, to_date = ask_date_range()
@@ -710,7 +712,7 @@ def screen_download(client: ZoomClient):
         f"  Потрібно скачати:    [cyan]{format_size(new_size)}[/]\n"
         f"  Вільно після:        [{after_color}]{format_size(max(after_free, 0))}[/]"
         + ("  [red]⚠ НЕДОСТАТНЬО![/]" if not enough else ""),
-        title=f"[cyan]💾  {output_dir}[/]",
+        title=f"[cyan]Диск: {output_dir}[/]",
         border_style="cyan" if enough else "red",
         padding=(1, 2),
     ))
@@ -863,47 +865,45 @@ def screen_download(client: ZoomClient):
 
 # ─── Точка входу ──────────────────────────────────────────────────────────────
 
-def render_main_storage_panel(client: ZoomClient, cached: dict | None) -> dict:
+def render_main_storage_panel(cached: dict | None):
     """
     Малює компактну шкалу сховища на головному екрані.
-    Якщо cached не None — використовує кешовані дані без нового запиту.
-    Повертає dict з даними для кешування.
+    Використовує тільки кешовані дані — без жодних API запитів.
+    API запит робиться тільки в screen_cloud_storage().
     """
-    if cached is None:
-        with console.status("[dim]Завантаження інфо про сховище...[/]", spinner="dots"):
-            info = client.get_cloud_storage_info()
+    # ── Zoom cloud (тільки з кешу) ──
+    if cached and cached.get("used", 0) > 0:
+        used  = cached["used"]
+        total = cached.get("total", 0)
+        users = cached.get("users_checked", 0)
+        if total > 0:
+            pct   = min(used / total * 100, 100)
+            free  = total - used
+            color = "green" if pct < 70 else "yellow" if pct < 90 else "red"
+            bar   = render_bar(used, total, width=28)
+            zoom_line = (
+                f"Zoom:  {bar} [{color}]{pct:.0f}%[/]  "
+                f"[cyan]{format_size(used)}[/] / {format_size(total)}  "
+                f"[dim]вільно {format_size(free)}[/]"
+            )
+        else:
+            bar = render_bar(used, used * 2, width=28)
+            zoom_line = (
+                f"Zoom:  {bar}  [cyan]{format_size(used)}[/]  "
+                f"[dim]{users} юзерів[/]"
+            )
     else:
-        info = cached
-
-    used  = info.get("used", 0)
-    total = info.get("total", 0)
-    users = info.get("users_checked", 0)
-
-    # ── Zoom cloud ──
-    if total > 0:
-        pct = min(used / total * 100, 100)
-        free = total - used
-        color = "green" if pct < 70 else "yellow" if pct < 90 else "red"
-        bar = render_bar(used, total, width=28)
         zoom_line = (
-            f"☁  Zoom:   {bar} [{color}]{pct:.0f}%[/]  "
-            f"[cyan]{format_size(used)}[/] / {format_size(total)}  "
-            f"[dim]вільно {format_size(free)}[/]"
-        )
-    else:
-        bar = render_bar(used, max(used * 2, 1), width=28)
-        zoom_line = (
-            f"☁  Zoom:   {bar} [dim]квота невідома[/]  "
-            f"[cyan]{format_size(used)}[/]  [dim]({users} юзерів)[/]"
+            "Zoom:  [dim]не завантажено — оберіть [1] щоб отримати дані[/]"
         )
 
-    # ── Локальний диск ──
-    local = shutil.disk_usage(Path.home())
-    lpct  = local.used / local.total * 100
+    # ── Локальний диск (завжди актуально, без API) ──
+    local  = shutil.disk_usage(Path.home())
+    lpct   = local.used / local.total * 100
     lcolor = "green" if lpct < 80 else "yellow" if lpct < 92 else "red"
-    lbar  = render_bar(local.used, local.total, width=28)
+    lbar   = render_bar(local.used, local.total, width=28)
     disk_line = (
-        f"💾  Диск:   {lbar} [{lcolor}]{lpct:.0f}%[/]  "
+        f"Диск:  {lbar} [{lcolor}]{lpct:.0f}%[/]  "
         f"[dim]вільно[/] [{lcolor}]{format_size(local.free)}[/]"
     )
 
@@ -913,13 +913,12 @@ def render_main_storage_panel(client: ZoomClient, cached: dict | None) -> dict:
         padding=(0, 1),
     ))
     console.print()
-    return info
 
 
 def screen_update():
     """Оновлення скрипту з GitHub через git pull."""
     import subprocess
-    draw_header("🔄 Оновлення скрипту")
+    draw_header("Оновлення скрипту з GitHub")
 
     script_dir = Path(__file__).parent
 
@@ -1058,33 +1057,33 @@ def screen_update():
 
 def main():
     client = ZoomClient()
-    storage_cache: dict | None = None   # кешуємо щоб не запитувати кожного разу
+    # Кеш заповнюється після відвідування screen_cloud_storage
+    # На головному екрані API не викликається — меню завжди відкривається миттєво
+    storage_cache: dict | None = None
 
     while True:
         draw_header()
-        storage_cache = render_main_storage_panel(client, storage_cache)
+        render_main_storage_panel(storage_cache)   # тільки відображення, без запитів
 
         action = inquirer.select(
             message="Виберіть дію:",
             choices=[
-                Choice("storage",  "☁   Детально про сховище / оновити"),
-                Choice("list",     "📋  Переглянути записи"),
-                Choice("download", "📥  Завантажити записи"),
-                Separator("─" * 30),
-                Choice("update",   "🔄  Оновити скрипт з GitHub"),
-                Choice("exit",     "❌  Вийти"),
+                Choice("storage",  "[1] Сховище     -- детально / оновити дані"),
+                Choice("list",     "[2] Записи      -- переглянути список"),
+                Choice("download", "[3] Завантажити -- скачати відео"),
+                Separator("─" * 40),
+                Choice("update",   "[U] Оновлення   -- оновити з GitHub"),
+                Choice("exit",     "[Q] Вийти"),
             ],
-            pointer="▶",
+            pointer=">>",
         ).execute()
 
         if action == "storage":
-            storage_cache = None
-            screen_cloud_storage(client)
+            storage_cache = screen_cloud_storage(client)  # повертає свіжі дані
         elif action == "list":
             screen_list_recordings(client)
         elif action == "download":
             screen_download(client)
-            storage_cache = None
         elif action == "update":
             screen_update()
         elif action == "exit":
