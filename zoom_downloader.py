@@ -596,7 +596,15 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
             rec_type = sanitize_filename(rec.get("recording_type") or "recording")
             dest = meeting_dir / f"{rec_type}.{ext}"
             size = rec.get("file_size") or 0
-            already_done = dest.exists() and (size == 0 or dest.stat().st_size == size)
+
+            # Пропускаємо файли з розміром 0 — Zoom їх включає в API,
+            # але контент не згенеровано (напр. closed_caption без live-captions)
+            if size == 0:
+                continue
+
+            # Файл вважається скачаним тільки якщо існує і не порожній
+            actual_size = dest.stat().st_size if dest.exists() else 0
+            already_done = actual_size > 0 and actual_size == size
 
             files.append({
                 "url": rec["download_url"],
@@ -728,6 +736,55 @@ def screen_list_recordings(client: ZoomClient):
 
     console.print(table)
     pause()
+
+
+LOG_PATH = Path(__file__).parent / "last_report.log"
+
+STATUS_LABEL = {
+    "ok":                "Скачано",
+    "retry_ok":          "Скачано (з повтором)",
+    "existed":           "Вже існував",
+    "existed_wrong_size":"Вже існував (розмір відрізняється!)",
+    "fail":              "ПОМИЛКА",
+}
+
+
+def write_report_log(results: list, counts: dict, ok_size: int, output_dir: Path) -> None:
+    """Записує plain-text звіт останнього завантаження у last_report.log."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    lines.append("=" * 72)
+    lines.append(f"  Zoom Recording Downloader — звіт завантаження")
+    lines.append(f"  {now}")
+    lines.append(f"  Папка: {output_dir}")
+    lines.append("=" * 72)
+    lines.append("")
+
+    # Детальна таблиця
+    lines.append(f"{'Стан':<24}  {'Дата':<12}  {'Файл':<30}  {'Розмір':>10}  Зустріч")
+    lines.append("-" * 110)
+    for r in sorted(results, key=lambda x: x["date"], reverse=True):
+        label    = STATUS_LABEL.get(r["status"], r["status"])
+        size_str = format_size(r["dest"].stat().st_size) if r["dest"].exists() else "—"
+        lines.append(
+            f"{label:<24}  {r['date']:<12}  {r['dest'].name:<30}  {size_str:>10}  {r['meeting'][:40]}"
+        )
+
+    # Підсумок
+    lines.append("")
+    lines.append("-" * 72)
+    total_dl = counts["ok"] + counts["retry_ok"]
+    if total_dl:
+        lines.append(f"  Скачано:              {total_dl} файл(ів)  ({format_size(ok_size)})")
+    if counts["existed"]:
+        lines.append(f"  Вже існували:         {counts['existed']} файл(ів)")
+    if counts["fail"]:
+        lines.append(f"  Помилки:              {counts['fail']} файл(ів)")
+    if counts["other"]:
+        lines.append(f"  Попередження:         {counts['other']} файл(ів)")
+    lines.append("=" * 72)
+
+    LOG_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _try_download(client: ZoomClient, f: dict) -> str:
@@ -913,9 +970,18 @@ def screen_download(client: ZoomClient):
             time.sleep(2)
             status2 = _try_download(client, f)
             if status2 == "ok":
-                actual = f["dest"].stat().st_size if f["dest"].exists() else 0
-                console.print(f"  [green]✓ Повтор успішний[/]  {format_size(actual)}\n")
-                status = "retry_ok"
+                # Повторна верифікація розміру після retry
+                actual2   = f["dest"].stat().st_size if f["dest"].exists() else 0
+                expected2 = f["size"]
+                if expected2 > 0 and actual2 != expected2:
+                    console.print(
+                        f"  [red]✗ Розмір після повтору не збігається:[/] "
+                        f"{format_size(actual2)} замість {format_size(expected2)}\n"
+                    )
+                    status = "fail"
+                else:
+                    console.print(f"  [green]✓ Повтор успішний[/]  {format_size(actual2)}\n")
+                    status = "retry_ok"
             else:
                 reason2 = status2.split(":", 1)[1] if ":" in status2 else status2
                 console.print(f"  [red]✗ Не вдалось:[/] {reason2}\n")
@@ -1004,6 +1070,9 @@ def screen_download(client: ZoomClient):
         border_style="red" if has_errors else "green",
         padding=(1, 2),
     ))
+
+    write_report_log(results, counts, ok_size, output_dir)
+    console.print(f"[dim]Звіт збережено: {LOG_PATH}[/]\n")
 
     pause()
 
