@@ -561,29 +561,65 @@ def fetch_all_recordings(client: ZoomClient, from_date: str, to_date: str) -> tu
     return all_meetings, errors
 
 
-MAX_FOLDER_NAME = 60   # символів для назви зустрічі у папці
-MAX_PATH_LEN    = 240  # залишаємо запас до ліміту Windows 260
+MAX_NAME_LEN = 120   # макс. символів для імені файлу (NTFS ліміт компонента — 255)
+MAX_PATH_LEN = 240   # залишаємо запас до ліміту Windows 260
 
 
-def safe_meeting_dir(output_dir: Path, date: str, topic: str) -> Path:
+def parse_start(start_time: str) -> tuple[str, str]:
     """
-    Структура: output_dir / YYYY-MM-DD / назва_зустрічі
-    Обрізає назву якщо загальний шлях надто довгий (ліміт Windows 260).
+    Розбирає Zoom start_time (UTC, напр. '2026-06-24T08:00:00Z') у ЛОКАЛЬНИЙ час.
+    Повертає (дата 'YYYY.MM.DD', час 'HH.MM', 24-год). Рік першим — щоб імена
+    сортувались хронологічно. Час через крапку, бо двокрапку Windows забороняє
+    в іменах файлів. Дата й час рахуються з одного локального моменту, тож вони
+    завжди узгоджені. Якщо розбір не вдався — fallback на зріз рядка (без часу).
     """
-    topic_short = topic[:MAX_FOLDER_NAME]
-    candidate = output_dir / date / topic_short
-    while len(str(candidate)) > MAX_PATH_LEN and len(topic_short) > 8:
-        topic_short = topic_short[:-5]
-        candidate = output_dir / date / topic_short
+    if not start_time:
+        return "", ""
+    try:
+        dt = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y.%m.%d"), dt.strftime("%H.%M")
+    except Exception:
+        return start_time[:10].replace("-", "."), ""
+
+
+def build_flat_dest(output_dir: Path, prefix: str, topic: str, ext: str, taken: set) -> Path:
+    """
+    Пласке ім'я файлу: output_dir / "YYYY.MM.DD Час-HH.MM Назва- Тема.ext"
+    `prefix` — готова ліва частина ("дата Час-HH.MM" або просто "дата", якщо часу нема).
+    - Обрізає назву, якщо повний шлях перевищує ліміт Windows (260).
+    - При колізії імен додає лічильник: " (2)", " (3)" ...
+    `taken` — множина вже зайнятих шляхів у цьому запуску (оновлюється in-place),
+    щоб два записи не перезаписали один одного. Порядок обходу детермінований,
+    тому при повторному запуску імена ті самі — докачка лишається ідемпотентною.
+    """
+    base = f"{prefix} Назва- {topic}" if topic else (prefix or "recording")
+
+    def make(stem: str, n: int) -> Path:
+        suffix = f" ({n})" if n > 1 else ""
+        return output_dir / f"{stem}{suffix}.{ext}"
+
+    # 1. Обрізаємо назву під ліміт повного шляху Windows
+    stem = base[:MAX_NAME_LEN]
+    while len(str(make(stem, 1))) > MAX_PATH_LEN and len(stem) > 8:
+        stem = stem[:-5]
+
+    # 2. Уникаємо колізій через лічильник
+    n = 1
+    candidate = make(stem, n)
+    while str(candidate).lower() in taken:
+        n += 1
+        candidate = make(stem, n)
+    taken.add(str(candidate).lower())
     return candidate
 
 
 def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
     files = []
+    taken: set = set()   # зайняті шляхи в цьому запуску — для лічильника колізій
     for meeting in sorted(meetings, key=lambda m: m.get("start_time", ""), reverse=True):
         topic = sanitize_filename(meeting.get("topic", "Без назви"))
-        date = (meeting.get("start_time") or "")[:10]
-        meeting_dir = safe_meeting_dir(output_dir, date, topic)
+        date, start_hm = parse_start(meeting.get("start_time") or "")
+        prefix = f"{date} Час-{start_hm}" if start_hm else date
 
         for rec in meeting.get("recording_files", []):
             ftype = (rec.get("file_type") or "").upper()
@@ -592,15 +628,16 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
             if rec.get("status", "completed") != "completed":
                 continue
 
-            ext = (rec.get("file_extension") or ftype).lower()
-            rec_type = sanitize_filename(rec.get("recording_type") or "recording")
-            dest = meeting_dir / f"{rec_type}.{ext}"
             size = rec.get("file_size") or 0
 
             # Пропускаємо файли з розміром 0 — Zoom їх включає в API,
-            # але контент не згенеровано (напр. closed_caption без live-captions)
+            # але контент не згенеровано (напр. closed_caption без live-captions).
+            # Робимо це ДО побудови імені, щоб порожні файли не з'їдали номер лічильника.
             if size == 0:
                 continue
+
+            ext = (rec.get("file_extension") or ftype).lower()
+            dest = build_flat_dest(output_dir, prefix, topic, ext, taken)
 
             # Файл вважається скачаним тільки якщо існує і не порожній
             actual_size = dest.stat().st_size if dest.exists() else 0
