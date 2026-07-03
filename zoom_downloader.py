@@ -616,7 +616,15 @@ def build_flat_dest(output_dir: Path, prefix: str, topic: str, ext: str, taken: 
 def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
     files = []
     taken: set = set()   # зайняті шляхи в цьому запуску — для лічильника колізій
-    for meeting in sorted(meetings, key=lambda m: m.get("start_time", ""), reverse=True):
+    # Tie-break по uuid: зустрічі різних юзерів збираються паралельно, тому при
+    # однаковому start_time порядок між запусками інакше плаває — і лічильник (2)
+    # діставався б щоразу іншому файлу, ламаючи ідемпотентність докачки.
+    meetings_sorted = sorted(
+        meetings,
+        key=lambda m: (m.get("start_time", ""), str(m.get("uuid") or m.get("id") or "")),
+        reverse=True,
+    )
+    for meeting in meetings_sorted:
         topic = sanitize_filename(meeting.get("topic", "Без назви"))
         date, start_hm = parse_start(meeting.get("start_time") or "")
         prefix = f"{date} Час-{start_hm}" if start_hm else date
@@ -803,9 +811,13 @@ def write_report_log(results: list, counts: dict, ok_size: int, output_dir: Path
     for r in sorted(results, key=lambda x: x["date"], reverse=True):
         label    = STATUS_LABEL.get(r["status"], r["status"])
         size_str = format_size(r["dest"].stat().st_size) if r["dest"].exists() else "—"
-        lines.append(
+        line = (
             f"{label:<24}  {r['date']:<12}  {r['dest'].name:<30}  {size_str:>10}  {r['meeting'][:40]}"
         )
+        # Причина помилки — без неї фейли в лозі неможливо діагностувати
+        if r.get("reason"):
+            line += f"  [{r['reason']}]"
+        lines.append(line)
 
     # Підсумок
     lines.append("")
@@ -991,6 +1003,7 @@ def screen_download(client: ZoomClient):
         )
 
         status = _try_download(client, f)
+        fail_reason = ""
 
         if status == "ok":
             # Верифікація розміру
@@ -1016,6 +1029,7 @@ def screen_download(client: ZoomClient):
                         f"{format_size(actual2)} замість {format_size(expected2)}\n"
                     )
                     status = "fail"
+                    fail_reason = f"розмір: {format_size(actual2)} замість {format_size(expected2)}"
                 else:
                     console.print(f"  [green]✓ Повтор успішний[/]  {format_size(actual2)}\n")
                     status = "retry_ok"
@@ -1023,8 +1037,9 @@ def screen_download(client: ZoomClient):
                 reason2 = status2.split(":", 1)[1] if ":" in status2 else status2
                 console.print(f"  [red]✗ Не вдалось:[/] {reason2}\n")
                 status = "fail"
+                fail_reason = reason2
 
-        results.append({**f, "status": status})
+        results.append({**f, "status": status, "reason": fail_reason})
 
     # Додаємо вже існуючі
     for f in already_ok:
