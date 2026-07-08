@@ -144,6 +144,25 @@ def sanitize_filename(name: str) -> str:
     return name.strip(". ") or "recording"
 
 
+MEDIA_EXTS = {".mp4", ".m4a"}
+
+
+def size_ok(dest: Path, actual: int, expected: int) -> bool:
+    """
+    Чи вважати розмір файлу коректним відносно того, що заявив Zoom API.
+    Для текстових файлів (транскрипти VTT, чати, субтитри) API віддає file_size,
+    що трохи розходиться з фактичним — тому суворо звіряємо лише медіа (mp4/m4a),
+    текстовим достатньо бути непорожніми.
+    """
+    if actual <= 0:
+        return False
+    if expected <= 0:
+        return True
+    if dest.suffix.lower() in MEDIA_EXTS:
+        return actual == expected
+    return True
+
+
 def split_date_range(from_date: str, to_date: str) -> list[tuple[str, str]]:
     """Розбиває діапазон дат на шматки ≤ 30 днів (ліміт Zoom API)."""
     fmt = "%Y-%m-%d"
@@ -377,7 +396,8 @@ class ZoomClient:
         resp = requests.get(f"{url}?access_token={token}", stream=True, timeout=60)
         resp.raise_for_status()
 
-        total = int(resp.headers.get("content-length", expected_size or 0))
+        cl_header = resp.headers.get("content-length")
+        total = int(cl_header) if cl_header else (expected_size or 0)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".part")
 
@@ -400,7 +420,10 @@ class ZoomClient:
                             progress.update(task, advance=len(chunk))
 
             actual = tmp.stat().st_size
-            if total > 0 and actual != total:
+            # content-length від сервера — сувора звірка (обрив передачі);
+            # розмір з API — м'яка, бо для текстових файлів Zoom його округлює
+            ok = (actual == total) if cl_header else size_ok(dest, actual, total)
+            if total > 0 and not ok:
                 console.print(
                     f"  [red]✗ Верифікація:[/] очікувано {format_size(total)}, "
                     f"отримано {format_size(actual)}"
@@ -667,7 +690,7 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
 
             # Файл вважається скачаним тільки якщо існує і не порожній
             actual_size = dest.stat().st_size if dest.exists() else 0
-            already_done = actual_size > 0 and actual_size == size
+            already_done = size_ok(dest, actual_size, size)
 
             files.append({
                 "url": rec["download_url"],
@@ -1027,7 +1050,7 @@ def screen_download(client: ZoomClient):
             # Верифікація розміру
             actual = f["dest"].stat().st_size if f["dest"].exists() else 0
             expected = f["size"]
-            if expected > 0 and actual != expected:
+            if not size_ok(f["dest"], actual, expected):
                 status = f"verify_fail:{format_size(actual)} замість {format_size(expected)}"
             else:
                 console.print(f"  [green]✓ Готово[/]  {format_size(actual)}\n")
@@ -1041,7 +1064,7 @@ def screen_download(client: ZoomClient):
                 # Повторна верифікація розміру після retry
                 actual2   = f["dest"].stat().st_size if f["dest"].exists() else 0
                 expected2 = f["size"]
-                if expected2 > 0 and actual2 != expected2:
+                if not size_ok(f["dest"], actual2, expected2):
                     console.print(
                         f"  [red]✗ Розмір після повтору не збігається:[/] "
                         f"{format_size(actual2)} замість {format_size(expected2)}\n"
@@ -1063,7 +1086,7 @@ def screen_download(client: ZoomClient):
     for f in already_ok:
         actual = f["dest"].stat().st_size if f["dest"].exists() else 0
         expected = f["size"]
-        verify = "existed" if (expected == 0 or actual == expected) else "existed_wrong_size"
+        verify = "existed" if size_ok(f["dest"], actual, expected) else "existed_wrong_size"
         results.append({**f, "status": verify})
 
     # 7. Детальний звіт
