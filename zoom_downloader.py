@@ -582,25 +582,30 @@ def parse_start(start_time: str) -> tuple[str, str]:
         return start_time[:10].replace("-", "."), ""
 
 
-def build_flat_dest(output_dir: Path, prefix: str, topic: str, ext: str, taken: set) -> Path:
+# Запас довжини шляху під ім'я файлу всередині папки зустрічі
+# (найдовше — "shared_screen_with_speaker_view(CC).mp4" ≈ 40 символів)
+INNER_NAME_RESERVE = 45
+
+
+def build_meeting_dir(output_dir: Path, prefix: str, topic: str, taken: set) -> Path:
     """
-    Пласке ім'я файлу: output_dir / "YYYY.MM.DD Час-HH.MM Назва- Тема.ext"
+    Папка зустрічі: output_dir / "YYYY.MM.DD Час-HH.MM Назва- Тема"
     `prefix` — готова ліва частина ("дата Час-HH.MM" або просто "дата", якщо часу нема).
-    - Обрізає назву, якщо повний шлях перевищує ліміт Windows (260).
-    - При колізії імен додає лічильник: " (2)", " (3)" ...
-    `taken` — множина вже зайнятих шляхів у цьому запуску (оновлюється in-place),
-    щоб два записи не перезаписали один одного. Порядок обходу детермінований,
-    тому при повторному запуску імена ті самі — докачка лишається ідемпотентною.
+    - Обрізає назву так, щоб шлях + ім'я файлу всередині влізли в ліміт Windows 260.
+    - При колізії (та сама дата+час+назва) додає лічильник: " (2)", " (3)" ...
+    `taken` — множина вже зайнятих шляхів папок у цьому запуску (оновлюється in-place).
+    Порядок обходу детермінований, тому при повторному запуску імена ті самі —
+    докачка лишається ідемпотентною.
     """
     base = f"{prefix} Назва- {topic}" if topic else (prefix or "recording")
 
     def make(stem: str, n: int) -> Path:
         suffix = f" ({n})" if n > 1 else ""
-        return output_dir / f"{stem}{suffix}.{ext}"
+        return output_dir / f"{stem}{suffix}"
 
-    # 1. Обрізаємо назву під ліміт повного шляху Windows
+    # 1. Обрізаємо назву: шлях папки + запас на ім'я файлу всередині ≤ ліміт
     stem = base[:MAX_NAME_LEN]
-    while len(str(make(stem, 1))) > MAX_PATH_LEN and len(stem) > 8:
+    while len(str(make(stem, 1))) + INNER_NAME_RESERVE > MAX_PATH_LEN and len(stem) > 8:
         stem = stem[:-5]
 
     # 2. Уникаємо колізій через лічильник
@@ -615,10 +620,10 @@ def build_flat_dest(output_dir: Path, prefix: str, topic: str, ext: str, taken: 
 
 def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
     files = []
-    taken: set = set()   # зайняті шляхи в цьому запуску — для лічильника колізій
+    taken_dirs: set = set()   # зайняті папки зустрічей — для лічильника колізій
     # Tie-break по uuid: зустрічі різних юзерів збираються паралельно, тому при
     # однаковому start_time порядок між запусками інакше плаває — і лічильник (2)
-    # діставався б щоразу іншому файлу, ламаючи ідемпотентність докачки.
+    # діставався б щоразу іншій зустрічі, ламаючи ідемпотентність докачки.
     meetings_sorted = sorted(
         meetings,
         key=lambda m: (m.get("start_time", ""), str(m.get("uuid") or m.get("id") or "")),
@@ -628,6 +633,9 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
         topic = sanitize_filename(meeting.get("topic", "Без назви"))
         date, start_hm = parse_start(meeting.get("start_time") or "")
         prefix = f"{date} Час-{start_hm}" if start_hm else date
+
+        meeting_dir: Path | None = None   # створюємо ліниво — лише якщо є що качати
+        used_names: set = set()           # імена всередині папки цієї зустрічі
 
         for rec in meeting.get("recording_files", []):
             ftype = (rec.get("file_type") or "").upper()
@@ -644,8 +652,18 @@ def build_file_list(meetings: list, output_dir: Path, file_types: set) -> list:
             if size == 0:
                 continue
 
+            if meeting_dir is None:
+                meeting_dir = build_meeting_dir(output_dir, prefix, topic, taken_dirs)
+
             ext = (rec.get("file_extension") or ftype).lower()
-            dest = build_flat_dest(output_dir, prefix, topic, ext, taken)
+            rec_type = sanitize_filename(rec.get("recording_type") or "recording")
+            fname = f"{rec_type}.{ext}"
+            n = 1
+            while fname.lower() in used_names:   # два записи одного типу в зустрічі
+                n += 1
+                fname = f"{rec_type} ({n}).{ext}"
+            used_names.add(fname.lower())
+            dest = meeting_dir / fname
 
             # Файл вважається скачаним тільки якщо існує і не порожній
             actual_size = dest.stat().st_size if dest.exists() else 0
